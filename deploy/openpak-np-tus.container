@@ -1,0 +1,17 @@
+# Sample only. Copy to ~/.config/containers/systemd/openpak-np-tus.container.
+[Unit]
+Description=OpenPak np-tus
+
+[Container]
+ContainerName=openpak-np-tus
+Image=ghcr.io/openpak/np-tus:latest
+Network=openpak
+EnvironmentFile=%h/openpak/deploy/np-tus.env
+Environment=NP_HTTP_ADDR=:8532
+Volume=%h/openpak/deploy/ps3-keys:/run/ps3:ro
+
+[Service]
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
