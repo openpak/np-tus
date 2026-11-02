@@ -36,6 +36,7 @@ Tests need PostgreSQL: `NP_TUS_TEST_DATABASE_URL=postgres://… GOWORK=off go te
 ## Docs
 
 - [Protocol](docs/protocol.md)
+- [Deploy](docs/deploy.md)
 
 ## Licence
 
