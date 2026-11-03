@@ -1,0 +1,302 @@
+syntax = "proto3";
+
+package openpak.titlestorage.v1;
+
+option go_package = "openpak/np-tus/internal/titlestoragepb;titlestoragepb";
+
+// The neutral per-title, per-account storage. Two shapes of data live under a title key that is
+// the same on every network (title_keys maps (network, native id) to it):
+//
+//   * variables: int64 slots (title, owner, slot) with the Title User Storage semantics: set,
+//     add, compare-and-set, multi-slot and multi-user reads, friend reads, who-wrote-it and
+//     when. Every write stamps the writer and a 10 ms timestamp that conditions can match.
+//   * objects: named blobs (title, owner, collection, name) with a small opaque info field,
+//     JSON metadata, a body, a visibility and an optional expiry. A stable numeric id is
+//     assigned on first write (a NEX DataStore data id, a course id). Collections separate
+//     uses inside one title ("tus" slots, "uploads", "courses", a SAKE table).
+//
+// An owner is a core account id (UUID) or a title-wide virtual user "v:<name>". Adapters map
+// their own ids (NpId, XUID, PID, profile id) to accounts before calling. Every request names
+// the caller's network ("np", "x360", "wiiu", "switch", "wfc", "xbox") and the title as that
+// network knows it. Titles are cross-network by default; a title with cross_network=false only
+// shows each network the rows that network wrote itself.
+//
+// Reads take a viewer (a core account id): private rows are visible to their owner only,
+// friends rows to the owner's friends (the account core's friend list), public rows to anyone.
+// Virtual owners are always readable and writable by every account. An empty viewer is an
+// anonymous reader: public rows only. Writes take a writer: it must be the owner, or a
+// virtual owner, or an account the account core lets the writer interact with.
+service TitleStorage {
+  // Variables
+  rpc SetVariables(SetVariablesRequest) returns (SetVariablesResponse);
+  rpc ListVariables(ListVariablesRequest) returns (ListVariablesResponse);
+  rpc AddVariable(AddVariableRequest) returns (VariableResult);
+  // TrySetVariable stores value when "operand <op> current" holds (a missing slot counts as 0).
+  rpc TrySetVariable(TrySetVariableRequest) returns (VariableResult);
+  rpc DeleteVariables(DeleteVariablesRequest) returns (DeleteResponse);
+
+  // Objects
+  rpc PutObject(PutObjectRequest) returns (ObjectResponse);
+  rpc GetObject(GetObjectRequest) returns (ObjectResponse);
+  rpc GetObjectByID(GetObjectByIDRequest) returns (ObjectResponse);
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+  rpc DeleteObjects(DeleteObjectsRequest) returns (DeleteResponse);
+
+  // Usage reports what one owner holds in one title against the quota.
+  rpc Usage(UsageRequest) returns (UsageResponse);
+
+  // Operator calls.
+  rpc MapTitle(MapTitleRequest) returns (MapTitleResponse);
+  rpc UpsertTitle(UpsertTitleRequest) returns (TitleInfo);
+  rpc ListTitles(ListTitlesRequest) returns (ListTitlesResponse);
+}
+
+// TitleRef names a title as a caller sees it. With network empty, title is the neutral key.
+message TitleRef {
+  string network = 1;
+  string title   = 2;
+}
+
+enum Visibility {
+  VISIBILITY_UNSPECIFIED = 0; // keep what is stored; a new row takes the title's default (private)
+  VISIBILITY_PRIVATE     = 1;
+  VISIBILITY_FRIENDS     = 2;
+  VISIBILITY_PUBLIC      = 3;
+}
+
+// Condition is the Title User Storage "comp-date" / "comp-setter" check: the write only happens
+// when the existing row was last changed at that time by that setter. A missing row fails a set
+// condition. Times are Unix milliseconds with 10 ms resolution.
+message Condition {
+  optional int64  expect_updated_unix_ms = 1;
+  optional string expect_setter          = 2;
+}
+
+// ---- variables ----
+
+message Variable {
+  string owner            = 1;
+  int32  slot             = 2;
+  int64  value            = 3;
+  string setter           = 4; // adapter-opaque (the PS3 JID); stored as given
+  int64  updated_unix_ms  = 5;
+  Visibility visibility   = 6;
+  string network          = 7; // the network that wrote it
+}
+
+message VariableItem {
+  int32 slot  = 1;
+  int64 value = 2;
+}
+
+message SetVariablesRequest {
+  TitleRef ref   = 1;
+  string owner   = 2;
+  string writer  = 3; // account id; "setter" is what the row remembers
+  string setter  = 4;
+  repeated VariableItem items = 5;
+  Visibility visibility       = 6;
+}
+message SetVariablesResponse {}
+
+message ListVariablesRequest {
+  TitleRef ref   = 1;
+  string viewer  = 2;
+  // The scope: these owners, or the viewer's friends (plus the viewer when include_self).
+  repeated string owners = 3;
+  bool friends_of_viewer = 4;
+  bool include_self      = 5;
+  repeated int32 slots   = 6; // empty = every slot
+  string sort            = 7; // "updated" (default) | "value" | "slot"
+  bool ascending         = 8; // default false: newest / largest first
+  uint32 offset          = 9;
+  uint32 limit           = 10; // default 100, max 1000
+}
+message ListVariablesResponse {
+  repeated Variable variables = 1;
+  uint32 hits = 2; // matches before offset and limit
+}
+
+message AddVariableRequest {
+  TitleRef ref   = 1;
+  string owner   = 2;
+  string writer  = 3;
+  string setter  = 4;
+  int32  slot    = 5;
+  int64  delta   = 6;
+  Condition condition = 7;
+  Visibility visibility = 8;
+}
+
+message TrySetVariableRequest {
+  TitleRef ref   = 1;
+  string owner   = 2;
+  string writer  = 3;
+  string setter  = 4;
+  int32  slot    = 5;
+  int64  value   = 6;
+  string op      = 7; // eq | ne | gt | ge | lt | le
+  int64  operand = 8; // compared with the current value; adapters pass value when they have no other
+  Condition condition = 9;
+  Visibility visibility = 10;
+}
+
+message VariableResult {
+  Variable variable       = 1; // the slot after the call (unchanged when stored is false)
+  bool stored             = 2;
+  bool condition_failed   = 3; // a Condition did not hold; nothing was written
+  bool had_previous       = 4;
+  int64 previous_value    = 5;
+}
+
+message DeleteVariablesRequest {
+  TitleRef ref   = 1;
+  string owner   = 2;
+  string writer  = 3;
+  repeated int32 slots = 4;
+}
+
+message DeleteResponse { uint32 deleted = 1; }
+
+// ---- objects ----
+
+// Object is a stored blob's metadata; the body is carried only when asked for.
+message Object {
+  uint64 id          = 1;
+  string title       = 2; // neutral key
+  string owner       = 3;
+  string collection  = 4;
+  string name        = 5;
+  bytes  info        = 6; // opaque, at most 4096 bytes
+  string meta_json   = 7; // a JSON object, at most 16 KiB; filterable with ListObjects.meta_filter_json
+  bytes  body        = 8;
+  uint64 size        = 9;
+  string setter      = 10;
+  Visibility visibility = 11;
+  string network     = 12;
+  int64  created_unix_ms = 13;
+  int64  updated_unix_ms = 14;
+  int64  expires_unix_ms = 15; // 0 = never
+}
+
+message PutObjectRequest {
+  TitleRef ref    = 1;
+  string owner    = 2;
+  string writer   = 3;
+  string setter   = 4;
+  string collection = 5; // default "default"
+  string name     = 6;   // empty: a new object named by its id
+  bytes info      = 7;
+  string meta_json = 8;
+  bytes body      = 9;
+  Visibility visibility = 10;
+  uint32 ttl_seconds = 11; // 0 = keeps its current expiry (never for a new object)
+  Condition condition = 12;
+}
+
+message GetObjectRequest {
+  TitleRef ref    = 1;
+  string viewer   = 2;
+  string owner    = 3; // empty: the newest object of that name under any owner (use only with unguessable names)
+  string collection = 4;
+  string name     = 5;
+  bool include_body = 6;
+}
+
+message GetObjectByIDRequest {
+  string network = 1; // the caller's network: a per-network title hides other networks' objects
+  string viewer  = 2;
+  uint64 id      = 3;
+  bool include_body = 4;
+}
+
+// ObjectResponse: found=false is "no such object or not visible to the viewer" (the same answer,
+// so a viewer cannot probe for private rows). condition_failed is only set by PutObject.
+message ObjectResponse {
+  Object object = 1;
+  bool found    = 2;
+  bool condition_failed = 3;
+}
+
+message ListObjectsRequest {
+  TitleRef ref   = 1;
+  string viewer  = 2;
+  repeated string owners = 3;
+  bool friends_of_viewer = 4;
+  bool include_self      = 5;
+  string collection      = 6; // empty = every collection
+  repeated string names  = 7; // empty = every name
+  string meta_filter_json = 8; // objects whose metadata contains this JSON (jsonb @>)
+  string sort            = 9;  // "updated" (default) | "created" | "size" | "name" | "id"
+  bool ascending         = 10;
+  uint32 offset          = 11;
+  uint32 limit           = 12; // default 100, max 1000
+  bool include_body      = 13;
+}
+message ListObjectsResponse {
+  repeated Object objects = 1;
+  uint32 hits = 2;
+}
+
+message DeleteObjectsRequest {
+  TitleRef ref   = 1;
+  string owner   = 2;
+  string writer  = 3;
+  string collection = 4;
+  repeated string names = 5; // empty = the whole collection
+}
+
+// ---- quota ----
+
+message UsageRequest {
+  TitleRef ref = 1;
+  string owner = 2;
+}
+message UsageResponse {
+  uint64 bytes = 1;
+  uint32 objects = 2;
+  uint32 variables = 3;
+  uint64 quota_bytes = 4;
+  uint32 quota_objects = 5;
+  uint32 max_object_bytes = 6;
+}
+
+// ---- operator ----
+
+message MapTitleRequest {
+  string title      = 1; // neutral key
+  string name       = 2;
+  string network    = 3;
+  string native_id  = 4;
+}
+message MapTitleResponse {}
+
+enum Tristate {
+  TRISTATE_UNSPECIFIED = 0;
+  TRISTATE_TRUE        = 1;
+  TRISTATE_FALSE       = 2;
+}
+
+message UpsertTitleRequest {
+  string title = 1;
+  string name  = 2;
+  Tristate cross_network = 3;
+  uint64 quota_bytes     = 4; // 0 = keep (the service default for a new title)
+  uint32 quota_objects   = 5;
+  uint32 max_object_bytes = 6;
+  Visibility default_visibility = 7;
+}
+
+message TitleInfo {
+  string title = 1;
+  string name  = 2;
+  bool cross_network = 3;
+  uint64 quota_bytes = 4;
+  uint32 quota_objects = 5;
+  uint32 max_object_bytes = 6;
+  Visibility default_visibility = 7;
+  map<string, string> native_ids = 8; // network -> native id
+}
+
+message ListTitlesRequest {}
+message ListTitlesResponse { repeated TitleInfo titles = 1; }

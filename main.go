@@ -13,8 +13,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func main() {
@@ -26,9 +24,9 @@ func main() {
 
 func run() error {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	dbURL := os.Getenv("NP_TUS_DATABASE_URL")
-	if dbURL == "" {
-		return fmt.Errorf("NP_TUS_DATABASE_URL must be set")
+	tsAddr, tsKey := os.Getenv("NP_TITLE_STORAGE_ADDR"), os.Getenv("NP_TITLE_STORAGE_KEY")
+	if tsAddr == "" || tsKey == "" {
+		return fmt.Errorf("NP_TITLE_STORAGE_ADDR and NP_TITLE_STORAGE_KEY must be set")
 	}
 	if len(os.Getenv("NP_CORE_KEY")) < 32 {
 		return fmt.Errorf("NP_CORE_KEY must be at least 32 bytes")
@@ -39,15 +37,11 @@ func run() error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	pool, err := pgxpool.New(ctx, dbURL)
+	storage, storageConn, err := DialStorage(tsAddr, tsKey)
 	if err != nil {
 		return err
 	}
-	defer pool.Close()
-	store := &Store{DB: pool}
-	if err := store.Migrate(ctx); err != nil {
-		return err
-	}
+	defer storageConn.Close()
 	core, err := coreclient.Dial(nphttp.Env("NP_CORE_ADDR", "localhost:7000"), os.Getenv("NP_CORE_KEY"))
 	if err != nil {
 		return err
@@ -57,7 +51,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	svc := &Service{Core: core, Tickets: signer, Store: store, ResourceKey: resourceKey,
+	svc := &Service{Core: core, Tickets: signer, Storage: storage, ResourceKey: resourceKey,
 		StorageFQDN: nphttp.Env("NP_STORAGE_FQDN", "tus.np.community.playstation.net"),
 		TSSDir:      os.Getenv("NP_TSS_DIR"), Log: log}
 	mux := http.NewServeMux()

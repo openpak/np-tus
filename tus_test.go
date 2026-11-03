@@ -17,35 +17,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"openpak/np-common/coreclient"
 	"openpak/np-common/fakecore"
 	"openpak/np-common/identity"
 	"openpak/np-common/resource"
 	"openpak/np-common/ticket"
+	"openpak/np-tus/internal/fakestorage"
 )
 
 const commid = "NPWR01234_00"
 
 func TestTUS(t *testing.T) {
-	dbURL := os.Getenv("NP_TUS_TEST_DATABASE_URL")
-	if dbURL == "" {
-		t.Skip("NP_TUS_TEST_DATABASE_URL not set")
-	}
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dbURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
-	store := &Store{DB: pool}
-	if err = store.Migrate(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = pool.Exec(ctx, "TRUNCATE tus_variables, tus_data"); err != nil {
-		t.Fatal(err)
-	}
-
 	const coreKey = "test-core-key-at-least-thirty-two-bytes"
 	const alice, bob, carol = "0b7c3f4e-1d2a-4c5b-9e8f-112233445566", "1b7c3f4e-1d2a-4c5b-9e8f-112233445566", "2b7c3f4e-1d2a-4c5b-9e8f-112233445566"
 	fake := fakecore.New(coreKey)
@@ -54,6 +37,11 @@ func TestTUS(t *testing.T) {
 	fake.AddAccount(fakecore.Account{ID: carol, DisplayName: "Carol", Country: "US"})
 	fake.AddFriend(alice, bob)
 	fake.SetBlocked(carol, alice, true)
+	// The storage service asks the same account core; its fake mirrors the friend graph and the block.
+	const storageKey = "test-storage-key"
+	fs := fakestorage.New(storageKey)
+	fs.AddFriend(alice, bob)
+	fs.SetBlocked(alice, carol)
 	core, err := coreclient.Dial("passthrough:///core", coreKey, fake.Serve(t)...)
 	if err != nil {
 		t.Fatal(err)
@@ -69,6 +57,11 @@ func TestTUS(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	storage, conn, err := DialStorage("passthrough:///storage", storageKey, fs.Serve(t)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
 	_, key, _ := ed25519.GenerateKey(rand.Reader)
 	signer, _ := ticket.New(key, nil)
 	raw, err := signer.Issue(ticket.Identity{AccountID: alice, LinkID: links[alice].LinkID, OnlineID: links[alice].OnlineID, Country: "pt", Service: "IV0001-NPXS01001_00"}, time.Hour)
@@ -80,7 +73,7 @@ func TestTUS(t *testing.T) {
 	os.WriteFile(filepath.Join(tss, commid, commid+"-0.tss"), []byte("tss-bytes"), 0o644)
 	resourceKey := bytes.Repeat([]byte{7}, 20)
 	mux := http.NewServeMux()
-	(&Service{Core: core, Tickets: signer, Store: store, ResourceKey: resourceKey, StorageFQDN: "tus.example", TSSDir: tss, Log: slog.Default()}).Register(mux)
+	(&Service{Core: core, Tickets: signer, Storage: storage, ResourceKey: resourceKey, StorageFQDN: "tus.example", TSSDir: tss, Log: slog.Default()}).Register(mux)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -188,6 +181,21 @@ func TestTUS(t *testing.T) {
 	}
 	r, _ = post("delete_multi_slot_variable", u(alice)+`<list><variable slot="1"/></list>`, nil)
 	expect(r, `result="00"`)
+
+	// comp-date: the date the server printed matches; any other does not.
+	r, _ = post("get_multi_slot_variable", u(alice)+`<list><variable slot="2"/></list>`, nil)
+	i := strings.Index(r, "<date>")
+	date := r[i+6 : i+6+strings.Index(r[i+6:], "<")]
+	r, _ = post("addget_variable", u(alice)+`<variable slot="2" value="1"/><comp-date>2001-01-01T00:00:00.00Z</comp-date>`, nil)
+	expect(r, `result="73"`)
+	r, _ = post("addget_variable", u(alice)+`<variable slot="2" value="1"/><comp-date>`+date+`</comp-date>`, nil)
+	expect(r, `value="-4"`)
+
+	// The storage service being down is a TUS internal error, not a hang or a wrong answer.
+	fs.Down = true
+	r, _ = post("get_multi_slot_variable", u(alice)+`<list><variable slot="2"/></list>`, nil)
+	expect(r, `result="07"`)
+	fs.Down = false
 
 	// Bad ticket.
 	env = strings.Replace(env, base64.StdEncoding.EncodeToString(raw), "AAAA", 1)
